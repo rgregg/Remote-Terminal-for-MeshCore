@@ -46,10 +46,23 @@ jobs:
             exit 1
           fi
 
+          git_hash="$(git rev-parse --short HEAD)"
+
+          # Releases own :latest. A tag push publishes :latest, :X.Y.Z and the
+          # hash; a main push publishes only :main and the hash, so an
+          # unreleased commit can never move :latest or overwrite a released
+          # :X.Y.Z. The hash tag is immutable and exact in both cases.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tags="latest $version $git_hash"
+          else
+            tags="main $git_hash"
+          fi
+
           {
             echo "image=$image"
             echo "version=$version"
-            echo "git_hash=$(git rev-parse --short HEAD)"
+            echo "git_hash=$git_hash"
+            echo "tags=$tags"
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
@@ -66,34 +79,39 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Reuse the repo's own publish script rather than a parallel buildx
-      # invocation, so CI and `scripts/build/publish.sh` cannot drift. It tags
-      # :latest, :X.Y.Z and :<short-sha>, and passes COMMIT_HASH through to the
-      # build (the Dockerfile surfaces it as ENV COMMIT_HASH and
-      # VITE_COMMIT_HASH, so the UI reports the build it came from).
+      # invocation, so CI and `scripts/build/publish.sh` cannot drift. Passing
+      # --tag also carries COMMIT_HASH into the build (the Dockerfile surfaces
+      # it as ENV COMMIT_HASH and VITE_COMMIT_HASH, so the UI reports the build
+      # it came from).
       - name: Build and push multi-arch image
         env:
           IMAGE: ${{ steps.meta.outputs.image }}
           VERSION: ${{ steps.meta.outputs.version }}
           GIT_HASH: ${{ steps.meta.outputs.git_hash }}
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          scripts/build/push_docker_multiarch.sh \
-            --version "$VERSION" \
-            --git-hash "$GIT_HASH" \
-            --image "$IMAGE" \
+          set -euo pipefail
+          args=(
+            --version "$VERSION"
+            --git-hash "$GIT_HASH"
+            --image "$IMAGE"
             --platforms linux/amd64,linux/arm64
+          )
+          for tag in $TAGS; do
+            args+=(--tag "$tag")
+          done
+          scripts/build/push_docker_multiarch.sh "${args[@]}"
 
       - name: Summary
         env:
           IMAGE: ${{ steps.meta.outputs.image }}
-          VERSION: ${{ steps.meta.outputs.version }}
-          GIT_HASH: ${{ steps.meta.outputs.git_hash }}
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
+          set -euo pipefail
           {
             echo "### Published"
             echo
             echo '```'
-            echo "$IMAGE:latest"
-            echo "$IMAGE:$VERSION"
-            echo "$IMAGE:$GIT_HASH"
+            for tag in $TAGS; do echo "$IMAGE:$tag"; done
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
