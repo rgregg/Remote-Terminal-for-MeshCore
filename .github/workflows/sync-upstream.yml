@@ -1,0 +1,211 @@
+name: Sync with upstream
+
+# Keeps this fork current with jkingsman/Remote-Terminal-for-MeshCore:
+#
+#   1. merges upstream/main into main, so the fork stays usable for feature
+#      work and PRs back upstream;
+#   2. mirrors new upstream release tags into this fork and publishes a
+#      container image for each.
+#
+# Upstream's tags cannot be used as-is: a tag build only runs if the publish
+# workflow exists at the tagged commit, and upstream's tags predate it. So each
+# mirrored tag is upstream's release tree with this fork's CI files overlaid on
+# top. None of those files are copied into the image, so the published artifact
+# is upstream's release code exactly.
+
+on:
+  schedule:
+    # 09:15 UTC daily. Off the hour, since the top of the hour is the busiest
+    # slot on shared runners.
+    - cron: '15 9 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/jkingsman/Remote-Terminal-for-MeshCore.git
+  # Files that must ride along on a mirrored release tag for it to be
+  # buildable. Everything here is CI-only and never enters the image.
+  CI_FILES: >-
+    .github/workflows/release-bundle.yml
+    .github/workflows/sync-upstream.yml
+    scripts/build/push_docker_multiarch.sh
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    outputs:
+      new_tags: ${{ steps.tags.outputs.new_tags }}
+      main_updated: ${{ steps.merge.outputs.updated }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git and upstream remote
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM"
+          git fetch upstream main --no-tags
+          # Keep upstream tags in their own namespace so they cannot collide
+          # with this fork's tags, which point at different commits.
+          git fetch upstream 'refs/tags/*:refs/upstream-tags/*' --force
+
+      - name: Merge upstream/main into main
+        id: merge
+        run: |
+          set -euo pipefail
+          git checkout main
+          before="$(git rev-parse HEAD)"
+
+          if [ "$(git rev-list --count HEAD..upstream/main)" -eq 0 ]; then
+            echo "main is already up to date with upstream"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git merge --no-edit upstream/main; then
+            git push origin main
+            after="$(git rev-parse HEAD)"
+            echo "merged upstream/main: $before -> $after"
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "::warning::Merge conflict with upstream/main; main left untouched"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Tag mirroring is deliberately independent of the merge above: a merge
+      # conflict must not also block release images.
+      - name: Mirror new upstream release tags
+        id: tags
+        run: |
+          set -euo pipefail
+
+          version_re='^[0-9]+\.[0-9]+\.[0-9]+$'
+
+          # Read the fork's tags from the remote, not `git tag -l`: fetching
+          # upstream can drag tags into local refs/tags via tag auto-following,
+          # which would make "do we already have this?" answer wrongly.
+          mapfile -t fork_tags < <(
+            git ls-remote --tags --refs origin \
+              | sed 's#.*refs/tags/##' | grep -E "$version_re" | sort -V || true
+          )
+          existing=" ${fork_tags[*]-} "
+
+          # Highest release tag the fork already has. Only strictly newer tags
+          # are mirrored, so the first run does not rebuild every historical
+          # upstream release.
+          highest="${fork_tags[${#fork_tags[@]}-1]-}"
+          echo "fork release tags: ${#fork_tags[@]}, highest: ${highest:-<none>}"
+
+          # lstrip=2 drops "refs/upstream-tags/". %(refname:short) would leave
+          # "upstream-tags/3.17.1" here, which no version regex matches.
+          mapfile -t upstream_tags < <(
+            git for-each-ref --format='%(refname:lstrip=2)' refs/upstream-tags \
+              | grep -E "$version_re" | sort -V || true
+          )
+          echo "upstream release tags: ${#upstream_tags[@]}"
+
+          new=()
+          for tag in "${upstream_tags[@]-}"; do
+            [ -n "$tag" ] || continue
+            # Already mirrored?
+            case "$existing" in *" $tag "*) continue ;; esac
+            # Newer than what we already have?
+            if [ -n "$highest" ] && [ "$(printf '%s\n%s\n' "$tag" "$highest" | sort -V | tail -1)" = "$highest" ]; then
+              continue
+            fi
+            new+=("$tag")
+          done
+
+          if [ "${#new[@]}" -eq 0 ]; then
+            echo "no new upstream release tags"
+            echo 'new_tags=[]' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "mirroring: ${new[*]}"
+          for tag in "${new[@]}"; do
+            git checkout -q --detach "refs/upstream-tags/$tag"
+            # Overlay this fork's CI onto upstream's release tree.
+            git checkout main -- $CI_FILES
+            git commit -q \
+              -m "CI: add publish workflow to upstream $tag" \
+              -m "Upstream release $tag with this fork's CI files overlaid, so the publish workflow and the --tag-capable push script are present at the tagged ref. Neither is copied into the image, so the published artifact is upstream's release code exactly."
+            git tag -a "$tag" -m "$tag (mirrored from upstream)"
+            git push origin "refs/tags/$tag"
+            echo "  tagged $tag at $(git rev-parse --short HEAD)"
+          done
+
+          printf 'new_tags=%s\n' "$(printf '%s\n' "${new[@]}" | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+
+      - name: Open an issue on merge conflict
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          title="Upstream sync: merge conflict with upstream/main"
+          # Don't pile up duplicates while the conflict is unresolved.
+          existing="$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            echo "issue #$existing already open"
+            exit 0
+          fi
+          # Quoted heredoc: backticks stay literal, nothing is expanded.
+          body="$(mktemp)"
+          cat > "$body" <<'EOF'
+          The scheduled upstream sync could not merge `upstream/main` into `main`.
+
+          `main` was left untouched. Resolve by hand:
+
+          ```bash
+          git remote add upstream https://github.com/jkingsman/Remote-Terminal-for-MeshCore.git   # once
+          git fetch upstream main
+          git merge upstream/main
+          # resolve conflicts, then
+          git push origin main
+          ```
+
+          Release-tag mirroring is unaffected and continues to run.
+          EOF
+          gh issue create --title "$title" --body-file "$body"
+
+  # Tags pushed above with GITHUB_TOKEN do not trigger the push-based publish,
+  # so invoke it explicitly for each mirrored tag.
+  publish-tags:
+    needs: sync
+    if: needs.sync.outputs.new_tags != '[]' && needs.sync.outputs.new_tags != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJSON(needs.sync.outputs.new_tags) }}
+    uses: ./.github/workflows/release-bundle.yml
+    with:
+      ref: ${{ matrix.tag }}
+    permissions:
+      contents: read
+      packages: write
+
+  # Likewise republish :main after a successful merge.
+  publish-main:
+    needs: sync
+    if: needs.sync.outputs.main_updated == 'true'
+    uses: ./.github/workflows/release-bundle.yml
+    with:
+      ref: main
+    permissions:
+      contents: read
+      packages: write

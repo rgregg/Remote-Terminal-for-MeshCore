@@ -7,9 +7,24 @@ on:
     tags:
       - '[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Ref to build (branch, tag or sha). Defaults to this ref.'
+        required: false
+        type: string
+  # Callable so sync-upstream.yml can publish a tag it just created. Tags
+  # pushed with GITHUB_TOKEN do not start a new workflow run, so an automated
+  # release has to invoke the build directly rather than rely on the push
+  # trigger above.
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Ref to build (branch, tag or sha).'
+        required: true
+        type: string
 
 concurrency:
-  group: publish-image-${{ github.ref }}
+  group: publish-image-${{ inputs.ref || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -21,9 +36,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Resolve image name and version
         id: meta
+        env:
+          # The ref being built. On a push this is the pushed ref; when called
+          # or dispatched it is the requested one.
+          BUILD_REF: ${{ inputs.ref || github.ref_name }}
         run: |
           set -euo pipefail
           # GHCR requires a lowercase image path; github.repository is mixed case.
@@ -39,28 +60,29 @@ jobs:
           [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
             echo "Version '$version' is not in X.Y.Z format" >&2; exit 1; }
 
-          # On a tag push, the tag must agree with pyproject.toml, otherwise the
-          # :X.Y.Z image would not contain the code that tag points at.
-          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "$version" ]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match pyproject.toml version $version" >&2
-            exit 1
-          fi
-
           git_hash="$(git rev-parse --short HEAD)"
 
-          # Releases own :latest. A tag push publishes the floating aliases
-          # plus the exact version; a main push publishes only :main and the
-          # hash, so an unreleased commit can never move :latest or overwrite a
-          # released :X.Y.Z.
+          # A ref named exactly X.Y.Z is a release build; anything else (main,
+          # a sha, a topic branch) is not. Deriving this from the ref name
+          # rather than github.ref_type keeps push, dispatch and call
+          # identical.
+          #
+          # Releases own :latest and the floating aliases:
           #
           #   :3       -> newest 3.y.z      (tracks minor + patch releases)
           #   :3.17    -> newest 3.17.z     (tracks patch releases only)
           #   :3.17.1  -> immutable, never moves
           #   :<sha>   -> immutable, never moves
           #
-          # Deployments pin :3.17 to pick up patches without re-pinning, or a
-          # full version/sha to freeze completely.
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+          # Non-release builds publish only :main and the sha, so an unreleased
+          # commit can never move :latest or overwrite a released :X.Y.Z.
+          if [[ $BUILD_REF =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            # The tag must agree with pyproject.toml, otherwise :X.Y.Z would
+            # not contain the code that tag names.
+            if [ "$BUILD_REF" != "$version" ]; then
+              echo "Ref $BUILD_REF does not match pyproject.toml version $version" >&2
+              exit 1
+            fi
             major="${version%%.*}"      # 3.17.1 -> 3
             minor="${version%.*}"       # 3.17.1 -> 3.17
             tags="latest $major $minor $version $git_hash"
@@ -116,10 +138,11 @@ jobs:
         env:
           IMAGE: ${{ steps.meta.outputs.image }}
           TAGS: ${{ steps.meta.outputs.tags }}
+          BUILD_REF: ${{ inputs.ref || github.ref_name }}
         run: |
           set -euo pipefail
           {
-            echo "### Published"
+            echo "### Published from \`$BUILD_REF\`"
             echo
             echo '```'
             for tag in $TAGS; do echo "$IMAGE:$tag"; done
